@@ -1,21 +1,25 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type Backend struct {
-	URL          *url.URL
-	ReverseProxy *httputil.ReverseProxy
-	Alive        bool
-	mux          sync.RWMutex
+	URL               *url.URL
+	ReverseProxy      *httputil.ReverseProxy
+	Alive             bool
+	mux               sync.RWMutex
+	ActiveConnections uint64
 }
 
 type ServerPool struct {
@@ -23,20 +27,28 @@ type ServerPool struct {
 	current  uint64
 }
 
-func (s *ServerPool) GetNextPeer() *Backend {
-	next := atomic.AddUint64(&s.current, 1)
-	length := uint64(len(s.backends))
+type EndPoints struct {
+	LBport  string   `json:"lbport"`
+	Servers []string `json:"servers"`
+}
 
-	for i := 0; i < int(length); i++ {
-		idx := (int(next) + i) % int(length)
-		if s.backends[idx].IsAlive() {
-			if i != 0 {
-				atomic.StoreUint64(&s.current, uint64(idx))
+func (s *ServerPool) GetNextPeer() *Backend {
+	var bestPeer *Backend = nil
+	var lowestActive uint64 = math.MaxUint64
+
+	for _, b := range s.backends {
+		if b.IsAlive() {
+			conns := atomic.LoadUint64(&b.ActiveConnections)
+			if conns < lowestActive {
+				lowestActive = conns
+				bestPeer = b
 			}
-			return s.backends[idx]
 		}
 	}
-	return nil
+	if bestPeer != nil {
+		atomic.AddUint64(&bestPeer.ActiveConnections, 1)
+	}
+	return bestPeer
 }
 
 func (s *ServerPool) AddBackend(serverURL string) {
@@ -51,15 +63,15 @@ func (s *ServerPool) AddBackend(serverURL string) {
 }
 
 func (b *Backend) SetAlive(alive bool) {
-	b.mux.Lock()
+	b.mux.RLock()
 	b.Alive = alive
-	b.mux.Unlock()
+	b.mux.RUnlock()
 }
 
 func (b *Backend) IsAlive() bool {
-	b.mux.Lock()
+	b.mux.RLock()
 	alive := b.Alive
-	b.mux.Unlock()
+	b.mux.RUnlock()
 	return alive
 }
 
@@ -77,23 +89,39 @@ func (s *ServerPool) HealthCheck() {
 		}
 
 		b.SetAlive(alive)
-		fmt.Printf("%s [%s]\n", b.URL, status)
+		fmt.Printf("%s %s [%s] Active: %d\n", time.Now().Format("15:04:05"), b.URL, status, b.ActiveConnections)
 	}
 }
 
 func (s *ServerPool) StartHealthCheck() {
 	for {
 		s.HealthCheck()
-		time.Sleep(20 * time.Second)
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func (e *EndPoints) LoadEnv(s *ServerPool) {
+	jsonFile, err := os.Open("config.json")
+	if err != nil {
+		panic(err)
+	}
+	defer jsonFile.Close()
+	decoder := json.NewDecoder(jsonFile)
+	err = decoder.Decode(e)
+	if err != nil {
+		panic(err)
+	}
+
+	for i := 0; i < len(e.Servers); i++ {
+		s.AddBackend(e.Servers[i])
 	}
 }
 
 func main() {
 	serverPool := &ServerPool{}
 
-	serverPool.AddBackend("http://localhost:8081")
-	serverPool.AddBackend("http://localhost:8082")
-	serverPool.AddBackend("http://localhost:8083")
+	var endPoints EndPoints
+	endPoints.LoadEnv(serverPool)
 
 	go serverPool.StartHealthCheck()
 
@@ -101,15 +129,18 @@ func main() {
 		peer := serverPool.GetNextPeer()
 
 		if peer != nil {
-			fmt.Printf("Redirecting to: %s\n", peer.URL)
+			fmt.Printf("Redirecting to: %s (Active: %d)\n", peer.URL, atomic.LoadUint64(&peer.ActiveConnections))
+			defer func() {
+				atomic.AddUint64(&peer.ActiveConnections, ^uint64(0))
+			}()
 			peer.ReverseProxy.ServeHTTP(w, r)
 			return
 		}
 		http.Error(w, "Service not available", http.StatusServiceUnavailable)
 	})
 
-	fmt.Println("Load Balancer running on port :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	fmt.Printf("Load Balancer running on port %s\n", endPoints.LBport)
+	if err := http.ListenAndServe(endPoints.LBport, nil); err != nil {
 		panic(err)
 	}
 }
