@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -55,17 +56,45 @@ func (s *ServerPool) AddBackend(serverURL string) {
 	u, _ := url.Parse(serverURL)
 	proxy := httputil.NewSingleHostReverseProxy(u)
 
-	s.backends = append(s.backends, &Backend{
+	backend := &Backend{
 		URL:          u,
 		ReverseProxy: proxy,
 		Alive:        true,
-	})
+	}
+
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
+		fmt.Printf("[%s] Request Failed: %s\n", u.Host, e.Error())
+
+		backend.SetAlive(false)
+
+		if r.Context().Value("retried") != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("Service Unavailable (Max retries reached)"))
+			return
+		}
+
+		if peer := s.GetNextPeer(); peer != nil {
+			fmt.Printf("... Retrying request on %s\n", peer.URL)
+
+			ctx := context.WithValue(r.Context(), "retried", true)
+
+			peer.ReverseProxy.ServeHTTP(w, r.WithContext(ctx))
+
+			atomic.AddUint64(&peer.ActiveConnections, ^uint64(0))
+			return
+		}
+
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("Service Unavailable (No healthy backends)"))
+	}
+
+	s.backends = append(s.backends, backend)
 }
 
 func (b *Backend) SetAlive(alive bool) {
-	b.mux.RLock()
+	b.mux.Lock()
 	b.Alive = alive
-	b.mux.RUnlock()
+	b.mux.Unlock()
 }
 
 func (b *Backend) IsAlive() bool {
@@ -129,7 +158,8 @@ func main() {
 		peer := serverPool.GetNextPeer()
 
 		if peer != nil {
-			fmt.Printf("Redirecting to: %s (Active: %d)\n", peer.URL, atomic.LoadUint64(&peer.ActiveConnections))
+			currentConns := atomic.LoadUint64(&peer.ActiveConnections)
+			fmt.Printf("[LB] Forwarding to %s | Active Conns: %d\n", peer.URL.Host, currentConns)
 			defer func() {
 				atomic.AddUint64(&peer.ActiveConnections, ^uint64(0))
 			}()
